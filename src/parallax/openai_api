@@ -1,0 +1,479 @@
+"""
+OpenAI Chat API implementation for Parallax.
+
+"""
+
+import asyncio
+import json
+import time
+import uuid
+from enum import Enum
+from typing import Any, Dict, List, Optional, Union
+from http import HTTPStatus
+
+import fastapi
+from fastapi.responses import StreamingResponse
+from pydantic import BaseModel, Field, validator
+
+from parallax.utils.logging_config import get_logger
+
+logger = get_logger(__name__)
+
+
+class ChatMessageRole(str, Enum):
+    """Chat message roles."""
+    SYSTEM = "system"
+    USER = "user"
+    ASSISTANT = "assistant"
+    TOOL = "tool"
+
+
+class ChatMessage(BaseModel):
+    """Chat message model."""
+    role: ChatMessageRole
+    content: Optional[Union[str, List[Dict[str, Any]]]] = None
+    name: Optional[str] = None
+    tool_calls: Optional[List[Dict[str, Any]]] = None
+    tool_call_id: Optional[str] = None
+
+    @validator('content')
+    def validate_content(cls, v, values):
+        if values.get('role') == ChatMessageRole.TOOL and v is None:
+            raise ValueError("Tool messages must have content")
+        return v
+
+
+class ToolFunction(BaseModel):
+    """Tool function definition."""
+    name: str
+    description: Optional[str] = None
+    parameters: Optional[Dict[str, Any]] = None
+
+
+class Tool(BaseModel):
+    """Tool definition."""
+    type: str = "function"
+    function: ToolFunction
+
+
+class ChatCompletionRequest(BaseModel):
+    """Chat completion request model."""
+    model: str = Field(..., description="Model name")
+    messages: List[ChatMessage] = Field(..., description="List of messages")
+    temperature: Optional[float] = Field(1.0, ge=0.0, le=2.0, description="Sampling temperature")
+    top_p: Optional[float] = Field(1.0, ge=0.0, le=1.0, description="Top-p sampling")
+    top_k: Optional[int] = Field(-1, ge=-1, description="Top-k sampling")
+    min_p: Optional[float] = Field(0.0, ge=0.0, le=1.0, description="Minimum probability")
+    max_tokens: Optional[int] = Field(2048, ge=1, description="Maximum tokens to generate")
+    min_tokens: Optional[int] = Field(0, ge=0, description="Minimum tokens to generate")
+    stop: Optional[Union[str, List[str]]] = Field(None, description="Stop sequences")
+    stop_token_ids: Optional[List[int]] = Field(None, description="Stop token IDs")
+    stream: Optional[bool] = Field(False, description="Enable streaming")
+    presence_penalty: Optional[float] = Field(0.0, ge=-2.0, le=2.0, description="Presence penalty")
+    frequency_penalty: Optional[float] = Field(0.0, ge=-2.0, le=2.0, description="Frequency penalty")
+    repetition_penalty: Optional[float] = Field(1.0, ge=0.0, le=2.0, description="Repetition penalty")
+    tools: Optional[List[Tool]] = Field(None, description="Available tools")
+    tool_choice: Optional[Union[str, Dict[str, Any]]] = Field(None, description="Tool choice strategy")
+    user: Optional[str] = Field(None, description="User identifier")
+    seed: Optional[int] = Field(None, description="Random seed")
+    response_format: Optional[Dict[str, Any]] = Field(None, description="Response format")
+
+    @validator('messages')
+    def validate_messages(cls, v):
+        if not v:
+            raise ValueError("Messages cannot be empty")
+        return v
+
+    @validator('stop')
+    def validate_stop(cls, v):
+        if isinstance(v, str):
+            return [v]
+        return v
+
+
+class ChatCompletionChoice(BaseModel):
+    """Chat completion choice."""
+    index: int
+    message: Optional[ChatMessage] = None
+    delta: Optional[ChatMessage] = None
+    finish_reason: Optional[str] = None
+    logprobs: Optional[Dict[str, Any]] = None
+
+
+class Usage(BaseModel):
+    """Token usage information."""
+    prompt_tokens: int
+    completion_tokens: int
+    total_tokens: int
+
+
+class ChatCompletionResponse(BaseModel):
+    """Chat completion response."""
+    id: str
+    object: str = "chat.completion"
+    created: int
+    model: str
+    choices: List[ChatCompletionChoice]
+    usage: Optional[Usage] = None
+
+
+class ChatCompletionStreamResponse(BaseModel):
+    """Chat completion stream response."""
+    id: str
+    object: str = "chat.completion.chunk"
+    created: int
+    model: str
+    choices: List[ChatCompletionChoice]
+    usage: Optional[Usage] = None
+
+
+class ErrorResponse(BaseModel):
+    """Error response model."""
+    error: Dict[str, Any]
+
+
+def create_error_response(
+    message: str,
+    error_type: str = "invalid_request_error",
+    status_code: HTTPStatus = HTTPStatus.BAD_REQUEST,
+    param: Optional[str] = None
+) -> fastapi.Response:
+    """Create error response."""
+    error_data = {
+        "error": {
+            "message": message,
+            "type": error_type,
+            "param": param,
+            "code": status_code.value
+        }
+    }
+    return fastapi.Response(
+        content=json.dumps(error_data),
+        status_code=status_code.value,
+        media_type="application/json"
+    )
+
+
+def convert_parallax_request(request: ChatCompletionRequest) -> Dict[str, Any]:
+    """Convert OpenAI request to Parallax format."""
+    parallax_request = {
+        "messages": [msg.dict() for msg in request.messages],
+        "max_tokens": request.max_tokens,
+        "sampling_params": {
+            "temperature": request.temperature,
+            "top_p": request.top_p,
+            "top_k": request.top_k,
+            "min_p": request.min_p,
+            "min_new_tokens": request.min_tokens,
+            "max_new_tokens": request.max_tokens,
+            "presence_penalty": request.presence_penalty,
+            "frequency_penalty": request.frequency_penalty,
+            "repetition_penalty": request.repetition_penalty,
+        }
+    }
+    
+    # Handle stop sequences
+    if request.stop:
+        parallax_request["sampling_params"]["stop_strs"] = request.stop
+    if request.stop_token_ids:
+        parallax_request["sampling_params"]["stop_token_ids"] = request.stop_token_ids
+    
+    # Handle tools
+    if request.tools:
+        parallax_request["tools"] = [tool.dict() for tool in request.tools]
+    
+    # Handle response format
+    if request.response_format:
+        parallax_request["response_format"] = request.response_format
+    
+    return parallax_request
+
+
+def create_chat_completion_response(
+    request_id: str,
+    model: str,
+    content: str,
+    finish_reason: str = "stop",
+    usage: Optional[Usage] = None
+) -> ChatCompletionResponse:
+    """Create chat completion response."""
+    choice = ChatCompletionChoice(
+        index=0,
+        message=ChatMessage(
+            role=ChatMessageRole.ASSISTANT,
+            content=content
+        ),
+        finish_reason=finish_reason
+    )
+    
+    return ChatCompletionResponse(
+        id=request_id,
+        created=int(time.time()),
+        model=model,
+        choices=[choice],
+        usage=usage
+    )
+
+
+def create_stream_chunk(
+    request_id: str,
+    model: str,
+    content: Optional[str] = None,
+    finish_reason: Optional[str] = None,
+    usage: Optional[Usage] = None
+) -> ChatCompletionStreamResponse:
+    """Create streaming response chunk."""
+    delta = ChatMessage(role=ChatMessageRole.ASSISTANT)
+    if content is not None:
+        delta.content = content
+    
+    choice = ChatCompletionChoice(
+        index=0,
+        delta=delta,
+        finish_reason=finish_reason
+    )
+    
+    return ChatCompletionStreamResponse(
+        id=request_id,
+        created=int(time.time()),
+        model=model,
+        choices=[choice],
+        usage=usage
+    )
+
+
+async def handle_chat_completion(
+    request: ChatCompletionRequest,
+    http_handler: Any,
+    stream: bool = False
+) -> Union[ChatCompletionResponse, StreamingResponse]:
+    """Handle chat completion request."""
+    try:
+        # Generate request ID
+        request_id = f"chatcmpl-{uuid.uuid4().hex[:29]}"
+        
+        # Convert to Parallax format
+        parallax_request = convert_to_parallax_request(request)
+        parallax_request["rid"] = request_id
+        parallax_request["stream"] = stream
+        
+        # Initialize request tracking
+        http_handler.request_result[request_id] = ""
+        http_handler.request_finish[request_id] = False
+        
+        # Send request to executor
+        http_handler.send_requests(parallax_request)
+        
+        if stream:
+            return await handle_streaming_response(request_id, request.model, http_handler)
+        else:
+            return await handle_non_streaming_response(request_id, request.model, http_handler)
+            
+    except Exception as e:
+        logger.error(f"Error handling chat completion: {e}")
+        return create_error_response(
+            f"Internal server error: {str(e)}",
+            "internal_error",
+            HTTPStatus.INTERNAL_SERVER_ERROR
+        )
+
+
+async def handle_non_streaming_response(
+    request_id: str,
+    model: str,
+    http_handler: Any
+) -> ChatCompletionResponse:
+    """Handle non-streaming response."""
+    content = ""
+    while True:
+        await asyncio.sleep(0.1)
+        content = http_handler.request_result.get(request_id, "")
+        is_finished = http_handler.request_finish.get(request_id, False)
+        if is_finished:
+            break
+    
+    # Clean up
+    del http_handler.request_result[request_id]
+    del http_handler.request_finish[request_id]
+    
+    # Determine finish reason
+    finish_reason = "stop"
+    if content.endswith("<|im_end|>"):
+        content = content[:-10]  # Remove end token
+        finish_reason = "stop"
+    
+    # Create usage info (simplified)
+    usage = Usage(
+        prompt_tokens=0,  # TODO: Calculate actual prompt tokens
+        completion_tokens=len(content.split()) if content else 0,  # Rough estimate
+        total_tokens=0
+    )
+    
+    return create_chat_completion_response(
+        request_id=request_id,
+        model=model,
+        content=content,
+        finish_reason=finish_reason,
+        usage=usage
+    )
+
+
+async def handle_streaming_response(
+    request_id: str,
+    model: str,
+    http_handler: Any
+) -> StreamingResponse:
+    """Handle streaming response."""
+    
+    async def generate_stream():
+        """Generate streaming chunks."""
+        try:
+            # Send initial chunk
+            yield f"data: {create_stream_chunk(request_id, model).json()}\n\n"
+            
+            previous_content = ""
+            while True:
+                await asyncio.sleep(0.1)
+                current_content = http_handler.request_result.get(request_id, "")
+                is_finished = http_handler.request_finish.get(request_id, False)
+                
+                # Send delta for new content
+                if current_content != previous_content:
+                    new_content = current_content[len(previous_content):]
+                    if new_content:
+                        chunk = create_stream_chunk(
+                            request_id=request_id,
+                            model=model,
+                            content=new_content
+                        )
+                        yield f"data: {chunk.json()}\n\n"
+                    previous_content = current_content
+                
+                if is_finished:
+                    # Send final chunk
+                    finish_reason = "stop"
+                    if current_content.endswith("<|im_end|>"):
+                        finish_reason = "stop"
+                    
+                    final_chunk = create_stream_chunk(
+                        request_id=request_id,
+                        model=model,
+                        finish_reason=finish_reason
+                    )
+                    yield f"data: {final_chunk.json()}\n\n"
+                    yield "data: [DONE]\n\n"
+                    break
+            
+            # Clean up
+            del http_handler.request_result[request_id]
+            del http_handler.request_finish[request_id]
+            
+        except Exception as e:
+            logger.error(f"Error in streaming response: {e}")
+            error_chunk = create_stream_chunk(
+                request_id=request_id,
+                model=model,
+                finish_reason="error"
+            )
+            yield f"data: {error_chunk.json()}\n\n"
+    
+    return StreamingResponse(
+        generate_stream(),
+        media_type="text/plain",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "Content-Type": "text/event-stream"
+        }
+    )
+
+
+# API Endpoints
+def setup_openai_routes(app: fastapi.FastAPI):
+    """Setup OpenAI API routes."""
+    
+    @app.post("/v1/chat/completions")
+    async def chat_completions(
+        request: ChatCompletionRequest,
+        raw_request: fastapi.Request
+    ):
+        """OpenAI Chat Completions endpoint - Full featured implementation."""
+        try:
+            # Validate request
+            if not request.messages:
+                return create_error_response("Messages cannot be empty")
+            
+            # Check if streaming is requested
+            stream = request.stream or False
+            
+            # Get HTTP handler from app state
+            http_handler = app.state.http_handler
+            
+            return await handle_chat_completion(request, http_handler, stream)
+            
+        except Exception as e:
+            logger.error(f"Error in chat completions endpoint: {e}")
+            return create_error_response(
+                f"Invalid request: {str(e)}",
+                "invalid_request_error"
+            )
+    
+    @app.post("/v1/chat/completions/simple")
+    async def chat_completions_simple(raw_request: fastapi.Request):
+        """Simple chat completions endpoint - Original implementation."""
+        try:
+            request_json = await raw_request.json()
+        except Exception as e:
+            return create_error_response("Invalid request body, error: ", str(e))
+        
+        request_id = f"chatcmpl-{uuid.uuid4()}"
+        request_json["rid"] = request_id
+        http_handler = app.state.http_handler
+        http_handler.request_result[request_id] = ""
+        http_handler.request_finish[request_id] = False
+        http_handler.send_requests(request_json)
+        
+        res = ""
+        while True:
+            await asyncio.sleep(0.1)
+            res = http_handler.request_result.get(request_id)
+            is_finish = http_handler.request_finish.get(request_id)
+            if is_finish:
+                break
+        
+        del http_handler.request_result[request_id]
+        del http_handler.request_finish[request_id]
+        return res
+    
+    @app.get("/v1/models")
+    async def list_models():
+        """List available models."""
+        return {
+            "object": "list",
+            "data": [
+                {
+                    "id": "parallax-model",
+                    "object": "model",
+                    "created": int(time.time()),
+                    "owned_by": "parallax"
+                }
+            ]
+        }
+    
+    @app.get("/health")
+    async def health_check():
+        """Health check endpoint."""
+        return {"status": "healthy", "timestamp": int(time.time())}
+    
+    @app.get("/")
+    async def root():
+        """Root endpoint."""
+        return {
+            "message": "Parallax OpenAI API Server",
+            "version": "1.0.0",
+            "endpoints": [
+                "/v1/chat/completions",
+                "/v1/models",
+                "/health"
+            ]
+        }
